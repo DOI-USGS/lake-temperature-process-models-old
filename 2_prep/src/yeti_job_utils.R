@@ -1,4 +1,43 @@
 
+#' @param nml_list a big 'ol list of the nml params that will be updated from the defaults
+#' @param temperature_file the feather file that includes site_id, depth, and temperature observed
+#' @param min_date minimum number of unique observation dates that must exist before a lake is included
+#' @param min_depths minimum number of depths per each unique date
+#' @param min_depth_density the average number of observations per meter for each unique date
+#' use `inf` to ignore
+#'
+#' @details `min_depth_density`` overrides `min_depths`` if the lake is shallow enough so
+#' that `ceiling`(`lake_depth` * `min_depth_density`) < `min_depths`
+filter_cal_lakes <- function(nml_JSON, temperature_file, min_dates, min_depths, min_depth_density = Inf){
+
+  message("warning, remove summarize for non-unique site_id, depth, date rows when that is in `prep`")
+  nml_list <- jsonlite::read_json(nml_JSON)
+
+  t_data <- readr::read_csv(temperature_file) %>% select(-source) %>%
+    group_by(site_id, date, depth) %>% summarise(temp = mean(temp)) %>% ungroup()
+  # first get the site_ids that have at least `min_date` unique dates,
+  # this will help us ignore lakes that definately won't be included:
+  meets_min_date <- select(t_data, site_id, date) %>%
+    distinct() %>% group_by(site_id) %>% tally() %>%
+    filter(n >= min_dates, site_id %in% names(nml_list)) %>% pull(site_id)
+
+  # find the min number of obs per date requirement for each lake by including `lake_depth` and `min_depth_density`
+  obs_requirements <- purrr::map(meets_min_date, function(x){
+    lake_depth <- nml_list[[x]]$init_profiles$lake_depth
+    min_obs <- min(ceiling(lake_depth * min_depth_density), min_depths)
+    data.frame(site_id = x, lake_depth = lake_depth, min_obs = min_obs, stringsAsFactors = FALSE)
+  }) %>% purrr::reduce(dplyr::bind_rows)
+
+
+  t_data %>% filter(site_id %in% meets_min_date) %>% left_join(obs_requirements) %>%
+    filter(depth <= lake_depth) %>% # removing any depths below `lake_depth`
+    group_by(site_id, date) %>% summarize(n_obs = length(depth), min_obs = dplyr::first(min_obs)) %>%
+    filter(n_obs >= min_obs) %>% # removing any dates that don't meet the requirement for a profile
+    group_by(site_id) %>% tally() %>% filter(n >= min_dates) %>% pull(site_id) # removing any lakes that don't meet the min dates requirement
+
+}
+
+
 
 yeti_put <- function(local_dir, dest_dir, files){
   user <- Sys.info()[['user']]
@@ -55,6 +94,12 @@ build_transfer_job_list <- function(fileout, cal_nml_obj, base_nml_list, sim_ids
   #   ))
 
   message('warning, this linked to the params used in `run_glm_cal` and they are hard-code here')
+  sim_n <- length(sim_ids)
+  sim_ids <- sim_ids[sim_ids %in% names(cal_nml_obj)]
+  if (sim_n != length(sim_ids)){
+    message('warning, not all sims within cal_nml; dropping ', sim_n - length(sim_ids), ' sims')
+  }
+
   all_jobs <- list()
   for (i in 1:length(sim_ids)){
     sim_id <- sim_ids[i]
@@ -64,20 +109,112 @@ build_transfer_job_list <- function(fileout, cal_nml_obj, base_nml_list, sim_ids
       base_nml_file = sprintf('2_prep/sync/%s.nml', sim_id),
       meteo_file = sprintf('2_prep/sync/%s', base_nml_list[[sim_id]]$meteo_fl),
       source_id = source_ids,
+      source_nml = sprintf('2_prep/sync/%s.nml', source_ids),
+
+      # something special for the params in optim:
+      #'cd','sw_factor','coef_mix_hyp'
+
+      source_cd = sapply(source_ids, function(x){
+        glmtools::get_nml_value(cal_nml_obj[[x]], arg_name = 'cd')
+      }, USE.NAMES = FALSE),
+      source_coef_mix_hyp = sapply(source_ids, function(x){
+        glmtools::get_nml_value(cal_nml_obj[[x]], arg_name = 'coef_mix_hyp')
+      }, USE.NAMES = FALSE),
+      source_sw_factor = sapply(source_ids, function(x){
+        glmtools::get_nml_value(cal_nml_obj[[x]], arg_name = 'sw_factor')
+      }, USE.NAMES = FALSE),
+
+      export_file = sprintf('3_run/sync/transfer_%s_rmse.csv', sim_id)
+    )
+
+    all_jobs[[i]] <- this_job
+  }
+  saveRDS(all_jobs, fileout)
+}
+
+
+build_transfer_test_job_list <- function(fileout, cal_nml_obj, base_nml_list, source_ids, test_ids){
+  # all_jobs <- list(
+  #   list(
+  #     sim_id = 'nhdhr_123423',
+  #     nml_file = '2_prep/sync/nhdhr_123423.nml',
+  #     meteo_file = '2_prep/sync/NLDAS_time[0.351500]_x[225]_y[159].csv',
+  #     source_id = c('nhdhr_166868607','nhdhr_166868799'),
+  #     source_cd = c(0.00123, 0.0122),
+  #     source_Kw = c(0.23, 0.52),
+  #     source_coef_wind_stir = c(0.22, 0.25),
+  #     export_file = '3_run/sync/transfer_nhdhr_123423_rmse.csv'
+  #   ))
+
+  message('warning, this linked to the params used in `run_glm_cal` and they are hard-code here')
+  all_jobs <- list()
+  for (i in 1:length(test_ids)){
+    sim_id <- test_ids[i]
+    cat('.')
+    this_job <- list(
+      sim_id = sim_id,
+      base_nml_file = sprintf('2_prep/sync/%s.nml', sim_id),
+      meteo_file = sprintf('2_prep/sync/%s', base_nml_list[[sim_id]]$meteo_fl),
+      source_id = source_ids,
+      # something special for the params in optim:
+
       source_cd = sapply(source_ids, function(x){
         glmtools::get_nml_value(cal_nml_obj[[x]], arg_name = 'cd')
       }, USE.NAMES = FALSE),
       source_Kw = sapply(source_ids, function(x){
         glmtools::get_nml_value(cal_nml_obj[[x]], arg_name = 'Kw')
       }, USE.NAMES = FALSE),
-      source_coef_wind_stir = sapply(source_ids, function(x){
-        glmtools::get_nml_value(cal_nml_obj[[x]], arg_name = 'coef_wind_stir')
+      source_coef_mix_hyp = sapply(source_ids, function(x){
+        glmtools::get_nml_value(cal_nml_obj[[x]], arg_name = 'coef_mix_hyp')
       }, USE.NAMES = FALSE),
-      export_file = sprintf('3_run/sync/transfer_%s_rmse.csv', sim_id)
+      source_longitude = sapply(source_ids, function(x){
+        glmtools::get_nml_value(cal_nml_obj[[x]], arg_name = 'longitude')
+      }, USE.NAMES = FALSE),
+      source_latitude = sapply(source_ids, function(x){
+        glmtools::get_nml_value(cal_nml_obj[[x]], arg_name = 'latitude')
+      }, USE.NAMES = FALSE),
+      source_bsn_len = sapply(source_ids, function(x){
+        glmtools::get_nml_value(cal_nml_obj[[x]], arg_name = 'bsn_len')
+      }, USE.NAMES = FALSE),
+      source_bsn_wid = sapply(source_ids, function(x){
+        glmtools::get_nml_value(cal_nml_obj[[x]], arg_name = 'bsn_wid')
+      }, USE.NAMES = FALSE),
+      source_max_layer_thick = sapply(source_ids, function(x){
+        glmtools::get_nml_value(cal_nml_obj[[x]], arg_name = 'max_layer_thick')
+      }, USE.NAMES = FALSE),
+      source_min_layer_thick = sapply(source_ids, function(x){
+        glmtools::get_nml_value(cal_nml_obj[[x]], arg_name = 'min_layer_thick')
+      }, USE.NAMES = FALSE),
+      source_sw_factor = sapply(source_ids, function(x){
+        glmtools::get_nml_value(cal_nml_obj[[x]], arg_name = 'sw_factor')
+      }, USE.NAMES = FALSE),
+      export_file = sprintf('3_run/sync/transfer_test_%s_rmse.csv', sim_id)
     )
     all_jobs[[i]] <- this_job
   }
   saveRDS(all_jobs, fileout)
+}
+
+build_pball_job_list <- function(fileout, cal_nml_ind, job_chunk = 40){
+  nml_file_info <- tibble(filepath = yaml::yaml.load_file(cal_nml_ind) %>% names()) %>%
+    tidyr::extract(filepath, 'site_id', "pball_(.*).nml", remove = FALSE)
+
+  start_idx <- seq(1, to = nrow(nml_file_info), by = job_chunk)
+  end_idx <- c(tail(start_idx - 1, -1), nrow(nml_file_info))
+  all_jobs <- list()
+  for (i in 1:length(start_idx)){
+    all_jobs[[i]] <- data.frame(stringsAsFactors = FALSE,
+                                sim_id = paste0('pball_', nml_file_info$site_id[start_idx[i]:end_idx[i]]),
+                                nml_file = paste0(nml_file_info$filepath[start_idx[i]:end_idx[i]]),
+                                meteo_file = paste0('2_prep/sync/', sapply(start_idx[i]:end_idx[i], FUN = function(x){
+                                  read_nml(nml_file_info$filepath[x]) %>% get_nml_value(arg_name = 'meteo_fl')
+                                })),
+                                export_file = paste0('3_run/sync/pball_', nml_file_info$site_id[start_idx[i]:end_idx[i]], '_temperatures.feather'))
+  }
+
+  saveRDS(all_jobs, fileout)
+
+
 }
 
 build_pb0_job_list <- function(fileout, nml_list, job_chunk = 40, temperature_file){
@@ -97,7 +234,7 @@ build_pb0_job_list <- function(fileout, nml_list, job_chunk = 40, temperature_fi
   #     stringsAsFactors = FALSE)
   # )
 
-  sim_ids <- read_feather(temperature_file) %>%
+  sim_ids <- readr::read_csv(temperature_file) %>%
     left_join(data.frame(site_id = names(nml_list), stringsAsFactors = FALSE), .) %>% group_by(site_id) %>%
     summarize(n = length(unique(date))) %>% arrange(desc(n)) %>% pull(site_id)
 
@@ -133,13 +270,34 @@ build_job_list <- function(sim_ids, job_chunk, nml_list){
 
 failed_array_jobs <- function(fileout, old_jobs, job_chunk, nml_list, dummy){
   old_jobs <- readRDS(old_jobs)
-  files_done <- dir('3_run/sync')
-  ids_done <- files_done %>% stringr::str_remove('pb0_') %>% stringr::str_remove("_temperatures.feather")
 
-  all_ids <- sapply(old_jobs, function(x) c(str_remove(x$sim_id, 'pb0_'))) %>% unlist() %>% as.vector()
-  failed_ids <- all_ids[!all_ids %in% ids_done]
-  build_job_list(failed_ids, job_chunk = job_chunk, nml_list) %>%
-    saveRDS(fileout)
+  export_filepaths <- unlist(sapply(old_jobs, function(x) c(x$export_file)))
+  files_missing <- export_filepaths[!file.exists(export_filepaths)]
+
+
+  if (all(str_detect('pball', string = files_missing))){
+
+    all_jobs <- list()
+
+    for (i in 1:length(files_missing)){
+      # figure out which list element this is in, remove the others
+
+      which_list <- which(unlist(sapply(1:length(old_jobs), function(x) any(old_jobs[[x]]$export_file == files_missing[i]))))
+      all_jobs[[i]] <- old_jobs[[which_list]] %>% filter(export_file == files_missing[i])
+    }
+
+    saveRDS(all_jobs, fileout)
+
+    return()
+  } else {
+    ids_done <- files_done %>% stringr::str_remove('pb0_') %>% stringr::str_remove("_temperatures.feather")
+
+    all_ids <- sapply(old_jobs, function(x) c(str_remove(x$sim_id, 'pb0_'))) %>% unlist() %>% as.vector()
+    failed_ids <- all_ids[!all_ids %in% ids_done]
+    build_job_list(failed_ids, job_chunk = job_chunk, nml_list) %>%
+      saveRDS(fileout)
+  }
+
 }
 
 remove_wrr <- function(temp_feather){
