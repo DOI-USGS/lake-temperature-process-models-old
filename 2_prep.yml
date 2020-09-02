@@ -37,6 +37,12 @@ targets:
   2_prep/out/nml_file_group.yml:
     command: write_nml_files(target_name, nml_list, base_nml = '2_prep/in/nhdhr_105231881.nml')
 
+  bad_segfault_lake:
+    command: c(I('nhdhr_59746189'))
+
+  hyperscales_unrun_ids:
+    command: filter_unrun(nml_list = nml_list, ran_source_ids, jared_test_ids, target_expansion_ids, bad_segfault_lake)
+
   # naming here should be pball instead of cal...geez a bunch of my decisions were shortsighted.
   2_prep/out/nml_cal_file_group.yml:
     command: write_result_nml_files(target_name, nml_objs = cal_result_nmls,
@@ -87,6 +93,11 @@ targets:
 
   ran_source_ids:
     command: extract_source_ids('2_prep/out/glm_transfer_array.rds')
+
+  target_expansion_ids:
+    command: extract_expansion_ids('../pgmtl-data-release/tmp/filtered_observations.rds',
+      target_ids = jared_test_ids,
+      source_ids = ran_source_ids)
 
   2_prep/out/glm_transfer_test_array.rds:
     command: build_transfer_test_job_list(target_name, cal_nml_obj = cal_result_nmls,
